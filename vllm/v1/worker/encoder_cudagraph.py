@@ -39,6 +39,11 @@ BudgetGraphMapKey: TypeAlias = int | tuple[int, CaptureAxisKeys]
 # Warn when capture axes multiply the captured graph count past this point.
 _CAPTURE_GRAPH_COUNT_WARNING_THRESHOLD = 64
 
+# Refuse to capture another encoder graph with less than this much device
+# memory free. Capture allocates into the graph pool; running the device out
+# here would surface as an opaque failure far from its cause.
+_CAPTURE_MIN_FREE_BYTES = 2 << 30  # 2 GiB
+
 
 @dataclass
 class BudgetGraphMetadata:
@@ -67,6 +72,13 @@ class BudgetGraphMetadata:
 
 class EncoderCudaGraphManager:
     """Budget-based CUDA graph capture/replay for vision encoders."""
+
+    # Class-level defaults: these are observability counters, and some callers
+    # (unit-test fixtures) construct a manager without running __init__.
+    # capture_failures is only ever replaced, never mutated in place, so the
+    # shared default dict cannot be written to.
+    eager_fallbacks: int = 0
+    capture_failures: dict[str, list[int]] = {}
 
     def __init__(
         self,
@@ -183,6 +195,8 @@ class EncoderCudaGraphManager:
         self.graph_pool: Any | None = None
         self.graph_hits = 0
         self.graph_misses = 0
+        self.eager_fallbacks = 0
+        self.capture_failures: dict[str, list[int]] = {}
         self.log_stats_interval = 100
 
         max_budget = self.token_budgets[-1]
@@ -255,18 +269,40 @@ class EncoderCudaGraphManager:
             )
 
         for path, budgets in self.path_token_budgets.items():
+            failed: set[int] = set()
             for token_budget in sorted(budgets, reverse=True):
                 if token_budget == 0:
                     continue
                 for axis_keys in itertools.product(*self._capture_axes):
-                    self._capture_budget_graph(
+                    if not self._capture_budget_graph(
                         token_budget,
                         path=path,
                         axis_keys=axis_keys,
-                    )
+                    ):
+                        failed.add(token_budget)
+            if failed:
+                # Capture-failure isolation: one bucket failing must not take
+                # the others with it. Drop only the budgets that failed, so
+                # budget selection can never choose a graph that is not there;
+                # a batch that would have used one now pads up into the next
+                # captured budget, or falls back to eager if none remains.
+                self.path_token_budgets[path] = [
+                    b for b in budgets if b not in failed
+                ]
+                self.capture_failures = {**self.capture_failures,
+                                         path: sorted(failed)}
+                logger.warning(
+                    "Encoder CUDA graph capture failed for path %r budgets %s; "
+                    "remaining captured budgets: %s",
+                    path,
+                    sorted(failed),
+                    self.path_token_budgets[path],
+                )
 
         logger.info(
-            "Encoder CUDA graph capture complete. Captured %d graphs across %d paths.",
+            "Encoder CUDA graph capture complete. Captured %d/%d graphs across "
+            "%d paths.",
+            self.get_num_captured_graphs(),
             num_graphs,
             len(self.path_token_budgets),
         )
@@ -274,6 +310,9 @@ class EncoderCudaGraphManager:
     def _num_graphs_for_budgets(self, budgets: list[int]) -> int:
         num_budgets = sum(1 for budget in budgets if budget != 0)
         return num_budgets * math.prod(len(axis) for axis in self._capture_axes)
+
+    def get_num_captured_graphs(self) -> int:
+        return sum(len(graphs) for graphs in self.budget_graphs.values())
 
     def get_num_graphs_to_capture(self) -> int:
         return sum(
@@ -294,8 +333,24 @@ class EncoderCudaGraphManager:
         token_budget: int,
         path: str = "default",
         axis_keys: CaptureAxisKeys = (),
-    ):
-        """Capture CUDA graph for a single token budget."""
+    ) -> bool:
+        """Capture CUDA graph for a single token budget.
+
+        Returns True if the graph was captured, False if capture was skipped or
+        failed. A failure here is isolated: the caller drops only this budget.
+        """
+        free_bytes, _ = torch.cuda.mem_get_info(self.device)
+        if free_bytes < _CAPTURE_MIN_FREE_BYTES:
+            logger.warning(
+                "Skipping encoder CUDA graph capture for path %r budget %d: "
+                "only %.2f GiB free on %s, need %.2f GiB headroom.",
+                path,
+                token_budget,
+                free_bytes / (1 << 30),
+                self.device,
+                _CAPTURE_MIN_FREE_BYTES / (1 << 30),
+            )
+            return False
         logger.debug(
             "Capturing encoder cudagraph for budget=%d, max_batch_size=%d, "
             "max_frames_per_batch=%d, axis_keys=%s",
@@ -307,29 +362,43 @@ class EncoderCudaGraphManager:
 
         graph_set = self._get_graph_set(path)
 
-        capture_inputs = self.model.prepare_encoder_cudagraph_capture_inputs(
-            token_budget,
-            self.max_batch_size,
-            self.max_frames_per_batch,
-            self.device,
-            self.dtype,
-            path,
-            axis_keys,
-        )
+        try:
+            capture_inputs = self.model.prepare_encoder_cudagraph_capture_inputs(
+                token_budget,
+                self.max_batch_size,
+                self.max_frames_per_batch,
+                self.device,
+                self.dtype,
+                path,
+                axis_keys,
+            )
 
-        values = capture_inputs.values
+            values = capture_inputs.values
 
-        with torch.inference_mode():
-            output = self.model.encoder_cudagraph_forward({**values}, path=path)
-            output_buffer = torch.empty_like(output)
+            # The warm-up call outside capture is required, not merely tidy:
+            # lazy cuBLAS/cuDNN handle creation during stream capture aborts
+            # with CUBLAS_STATUS_NOT_INITIALIZED.
+            with torch.inference_mode():
+                output = self.model.encoder_cudagraph_forward({**values}, path=path)
+                output_buffer = torch.empty_like(output)
 
-        graph = torch.cuda.CUDAGraph()
-        with (
-            torch.inference_mode(),
-            torch.cuda.graph(graph, pool=self.graph_pool, stream=current_stream()),
-        ):
-            output = self.model.encoder_cudagraph_forward({**values}, path=path)
-            output_buffer.copy_(output)
+            graph = torch.cuda.CUDAGraph()
+            with (
+                torch.inference_mode(),
+                torch.cuda.graph(graph, pool=self.graph_pool, stream=current_stream()),
+            ):
+                output = self.model.encoder_cudagraph_forward({**values}, path=path)
+                output_buffer.copy_(output)
+        except Exception:
+            logger.exception(
+                "Encoder CUDA graph capture failed for path %r budget %d "
+                "(axis_keys=%s); this budget will be skipped.",
+                path,
+                token_budget,
+                axis_keys,
+            )
+            torch.cuda.synchronize()
+            return False
 
         graph_map_key: BudgetGraphMapKey = (
             token_budget if not axis_keys else (token_budget, axis_keys)
@@ -343,6 +412,7 @@ class EncoderCudaGraphManager:
             output_buffer=output_buffer,
             axis_keys=axis_keys,
         )
+        return True
 
     def _find_smallest_fitting_budget_given_tokens(
         self, total_tokens: int, budgets: list[int] | None = None
@@ -521,15 +591,30 @@ class EncoderCudaGraphManager:
                             batch_mm_kwargs, path=path
                         )
                 else:
-                    all_eager = False
                     graph_output = self._run_budget_graph(
                         batch_mm_kwargs,
                         token_budget,
                         path=path,
                         axis_keys=axis_keys,
                     )
-                    assert graph_output is not None
-                    output = graph_output
+                    if graph_output is None:
+                        # The selected budget has no captured graph (capture
+                        # failed for it, or an axis key combination is absent).
+                        # Fall back rather than abort the request.
+                        self.eager_fallbacks += len(batch_indices)
+                        logger.warning_once(
+                            "Encoder CUDA graph missing for path %r budget %d; "
+                            "falling back to eager for this batch.",
+                            path,
+                            token_budget,
+                        )
+                        with torch.inference_mode():
+                            output = self.model.encoder_eager_forward(
+                                batch_mm_kwargs, path=path
+                            )
+                    else:
+                        all_eager = False
+                        output = graph_output
                 graph_outputs[path] = output
 
             if all_eager:
@@ -734,7 +819,10 @@ class EncoderCudaGraphManager:
         return {
             "graph_hits": self.graph_hits,
             "graph_misses": self.graph_misses,
+            "eager_fallbacks": self.eager_fallbacks,
             "hit_rate": hit_rate,
             "num_budgets": num_budgets,
             "token_budgets": self.token_budgets,
+            "captured_token_budgets": dict(self.path_token_budgets),
+            "capture_failures": dict(self.capture_failures),
         }

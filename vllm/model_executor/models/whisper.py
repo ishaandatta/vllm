@@ -3,9 +3,9 @@
 
 import enum
 import math
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Hashable, Iterable, Mapping, Sequence
 from contextlib import nullcontext
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated, Any
 
 import numpy as np
 import torch
@@ -72,6 +72,7 @@ from vllm.v1.attention.backend import (
 
 from .interfaces import (
     MultiModalEmbeddings,
+    SupportsEncoderCudaGraph,
     SupportsLoRA,
     SupportsMultiModal,
     SupportsTranscription,
@@ -85,6 +86,14 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.encoder_cudagraph_defs import (
+        EncoderCudaGraphCaptureInputs,
+        EncoderCudaGraphConfig,
+        EncoderCudaGraphReplayBuffers,
+        EncoderItemSpec,
+    )
 
 
 class WhisperPosEmbedType(enum.Enum):
@@ -820,6 +829,7 @@ class WhisperForConditionalGeneration(
     SupportsTranscription,
     SupportsMultiModal,
     SupportsLoRA,
+    SupportsEncoderCudaGraph,
 ):
     # LoRA-specific attributes
     packed_modules_mapping = {
@@ -1042,6 +1052,170 @@ class WhisperForConditionalGeneration(
             input_features = json_map_leaves(lambda x: x.to(self.dtype), input_features)
 
         return WhisperAudioInputs(input_features=input_features)
+
+
+    # ------------------------------------------------------------------
+    # SupportsEncoderCudaGraph
+    #
+    # Whisper is the structurally simplest case this framework supports:
+    # the encoder input is a dense, rectangular [B, num_mel_bins, 3000] tensor,
+    # the only dimension that varies is the batch, and every item produces
+    # exactly max_source_positions (1500) output tokens regardless of its
+    # content. Token budgets and item counts are therefore interchangeable and
+    # the manager's greedy packing degenerates to fixed-size chunking.
+    # See docs/design/cuda_graphs_multimodal.md for the framework contract.
+    # ------------------------------------------------------------------
+
+    @property
+    def _encoder_output_tokens(self) -> int:
+        """Encoder output tokens per audio item. Constant by construction."""
+        return self.config.max_source_positions
+
+    @property
+    def _encoder_input_frames(self) -> int:
+        """Mel frames per audio item, i.e. the encoder input length."""
+        return self.config.max_source_positions * self.model.encoder.total_stride
+
+    @staticmethod
+    def _as_batched_features(input_features: Any) -> torch.Tensor:
+        """Normalise the mm kwarg to a dense [B, mel, frames] tensor.
+
+        ``MultiModalFieldConfig.batched("audio")`` already yields a stacked
+        tensor in the serving path, but the kwarg is typed as
+        ``Tensor | list[Tensor]`` so handle both rather than assume.
+        """
+        if isinstance(input_features, torch.Tensor):
+            return input_features if input_features.ndim == 3 else input_features[None]
+        return torch.stack([f if f.ndim == 2 else f[0] for f in input_features])
+
+    def get_encoder_cudagraph_config(self) -> "EncoderCudaGraphConfig":
+        from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphConfig
+
+        return EncoderCudaGraphConfig(
+            modalities=["audio"],
+            buffer_keys=["input_features"],
+            out_hidden_size=self.config.d_model,
+        )
+
+    def get_encoder_cudagraph_budget_range(
+        self,
+        vllm_config: VllmConfig,
+    ) -> tuple[int, int]:
+        """Smallest and largest capture budget, in encoder output tokens.
+
+        Deliberately NOT ``min(max_num_batched_tokens, max_model_len)``, the
+        idiom every vision implementor uses. For an encoder-decoder model
+        ``max_model_len`` is the *decoder* length (448 for Whisper) while a
+        single audio item already costs 1500 encoder tokens, so that idiom
+        yields ``min_budget > max_budget`` and a hard ValueError at startup.
+        The encoder budget is a scheduler quantity here, not a sequence length.
+
+        The upper bound is rounded down to a whole number of items so that the
+        generated power-of-two ladder lands on exact item counts
+        ([1500, 3000, 6000, ...] == [1, 2, 4, ...] audios) with no ragged
+        trailing budget.
+        """
+        tokens = self._encoder_output_tokens
+        scheduler_config = vllm_config.scheduler_config
+        budget = max(scheduler_config.max_num_encoder_input_tokens, tokens)
+        max_items = max(1, min(budget // tokens, scheduler_config.max_num_seqs))
+        return (tokens, tokens * max_items)
+
+    def get_encoder_cudagraph_item_specs(
+        self,
+        mm_kwargs: dict[str, Any],
+    ) -> list["EncoderItemSpec"]:
+        from vllm.v1.worker.encoder_cudagraph_defs import EncoderItemSpec
+
+        num_items = len(self._as_batched_features(mm_kwargs["input_features"]))
+        # No device->host read here: every Whisper item has identical size.
+        return [
+            EncoderItemSpec(
+                input_size=self._encoder_input_frames,
+                output_tokens=self._encoder_output_tokens,
+            )
+            for _ in range(num_items)
+        ]
+
+    def select_encoder_cudagraph_items(
+        self,
+        mm_kwargs: dict[str, Any],
+        indices: list[int],
+    ) -> dict[str, Any]:
+        features = self._as_batched_features(mm_kwargs["input_features"])
+        if len(indices) == 0:
+            return {"input_features": features[:0]}
+        index = torch.as_tensor(indices, device=features.device, dtype=torch.long)
+        return {"input_features": features.index_select(0, index)}
+
+    def prepare_encoder_cudagraph_capture_inputs(
+        self,
+        token_budget: int,
+        max_batch_size: int,
+        max_frames_per_batch: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        path: str = "default",
+        axis_keys: tuple[Hashable, ...] | None = None,
+    ) -> "EncoderCudaGraphCaptureInputs":
+        from vllm.v1.worker.encoder_cudagraph_defs import (
+            EncoderCudaGraphCaptureInputs,
+        )
+
+        # max_frames_per_batch is a video concept; audio has no frame axis.
+        num_audios = max(
+            1, min(token_budget // self._encoder_output_tokens, max_batch_size)
+        )
+        dummy_features = torch.zeros(
+            num_audios,
+            self.config.num_mel_bins,
+            self._encoder_input_frames,
+            device=device,
+            dtype=dtype,
+        )
+        return EncoderCudaGraphCaptureInputs({"input_features": dummy_features})
+
+    def prepare_encoder_cudagraph_replay_buffers(
+        self,
+        mm_kwargs: dict[str, Any],
+        max_batch_size: int,
+        max_frames_per_batch: int,
+        path: str = "default",
+    ) -> "EncoderCudaGraphReplayBuffers":
+        from vllm.v1.worker.encoder_cudagraph_defs import (
+            EncoderCudaGraphReplayBuffers,
+        )
+
+        features = self._as_batched_features(mm_kwargs["input_features"])
+        # The manager zeroes the captured buffer and slice-copies this in, so
+        # padded rows are zeros and their (discarded) outputs cannot leak into
+        # a real item's slice.
+        return EncoderCudaGraphReplayBuffers(
+            values={"input_features": features.to(self.dtype)}
+        )
+
+    def encoder_cudagraph_forward(
+        self,
+        inputs: dict[str, torch.Tensor],
+        path: str = "default",
+    ) -> torch.Tensor:
+        hidden_states = self.model.encoder(inputs["input_features"])
+        # [B, 1500, D] -> [B * 1500, D]. scatter_output_slices() slices dim 0 of
+        # a flat [total_tokens, hidden] tensor; returning the 3-D tensor would
+        # silently scatter wrong slices rather than raise.
+        return hidden_states.flatten(end_dim=1)
+
+    def encoder_eager_forward(
+        self,
+        mm_kwargs: dict[str, Any],
+        path: str = "default",
+    ) -> torch.Tensor:
+        audio_input = self._parse_and_validate_audio_input(**mm_kwargs)
+        encoder_outputs = self.model.get_encoder_outputs(
+            audio_input["input_features"]
+        )
+        assert encoder_outputs is not None
+        return encoder_outputs.flatten(end_dim=1)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         logits = self.logits_processor(self.proj_out, hidden_states)
