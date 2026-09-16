@@ -133,17 +133,56 @@ def test_item_specs_accept_a_list_of_tensors(model):
     assert len(model.get_encoder_cudagraph_item_specs({"input_features": feats})) == 3
 
 
-@pytest.mark.parametrize("indices", [[0], [2, 0], [], [1, 1]])
-def test_select_items_picks_the_right_rows(model, indices):
+@pytest.mark.parametrize(
+    "as_input",
+    [
+        lambda f: f,
+        lambda f: f.transpose(1, 2).contiguous().transpose(1, 2),
+        list,
+    ],
+    ids=["tensor", "noncontiguous_tensor", "list"],
+)
+@pytest.mark.parametrize(
+    "indices", [[0], [1, 2], [0, 1, 2, 3], [2, 0], [0, 2], [], [1, 1]]
+)
+def test_select_items_picks_the_right_rows(model, indices, as_input):
     feats = torch.arange(4 * N_MEL * FRAMES, dtype=torch.float32).reshape(
         4, N_MEL, FRAMES
     )
-    out = model.select_encoder_cudagraph_items({"input_features": feats}, indices)[
-        "input_features"
-    ]
+    out = model.select_encoder_cudagraph_items(
+        {"input_features": as_input(feats)}, indices
+    )["input_features"]
     assert out.shape == (len(indices), N_MEL, FRAMES)
     for pos, src in enumerate(indices):
         assert torch.equal(out[pos], feats[src])
+
+
+@pytest.mark.parametrize("indices", [[3, 4], [4], [-1], [-1, 0]])
+def test_select_items_rejects_out_of_range_rows(model, indices):
+    """A contiguous run past either end must not be truncated or wrapped."""
+    feats = torch.zeros(4, N_MEL, FRAMES)
+    with pytest.raises(IndexError):
+        model.select_encoder_cudagraph_items({"input_features": feats}, indices)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("indices", [[0], [1, 2], [0, 1, 2, 3], []])
+def test_contiguous_selection_does_not_synchronize(model, indices):
+    """Selecting a replay chunk must not wait for previously queued GPU work."""
+    feats = torch.arange(24, device="cuda", dtype=torch.float16).reshape(4, 2, 3)
+    expected = feats[indices].clone()
+    torch.accelerator.synchronize()
+    previous_mode = torch.cuda.get_sync_debug_mode()
+    try:
+        torch.cuda.set_sync_debug_mode("error")
+        out = model.select_encoder_cudagraph_items({"input_features": feats}, indices)[
+            "input_features"
+        ]
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_mode)
+    assert out.dtype == feats.dtype
+    assert out.device == feats.device
+    assert torch.equal(out, expected)
 
 
 @pytest.mark.parametrize(
