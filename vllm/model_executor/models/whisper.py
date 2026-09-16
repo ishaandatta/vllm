@@ -1145,6 +1145,13 @@ class WhisperForConditionalGeneration(
         features = self._as_batched_features(mm_kwargs["input_features"])
         if len(indices) == 0:
             return {"input_features": features[:0]}
+        # The manager's chunks are contiguous runs. Slice those rather than
+        # build a device index tensor, whose H2D copy blocks on the stream.
+        # Consumers only read the selection, so a view is safe.
+        start = indices[0]
+        stop = start + len(indices)
+        if start >= 0 and stop <= len(features) and indices == list(range(start, stop)):
+            return {"input_features": features[start:stop]}
         index = torch.as_tensor(indices, device=features.device, dtype=torch.long)
         return {"input_features": features.index_select(0, index)}
 
